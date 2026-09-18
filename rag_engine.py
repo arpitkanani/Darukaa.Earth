@@ -8,25 +8,20 @@ from collections.abc import Iterator
 from functools import lru_cache
 from typing import Any
 
-# sentence-transformers only needs the PyTorch path here. Disabling optional
-# TensorFlow imports avoids unrelated local TensorFlow/protobuf conflicts.
-os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
-
 import chromadb
 from dotenv import load_dotenv
 from groq import Groq
 from google import genai
 from google.genai import errors as genai_errors
-from sentence_transformers import SentenceTransformer
+
+from embeddings import embed_texts
 
 import memory
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(ROOT, ".env"))
-COLLECTION = "biodiversity_knowledge"
+COLLECTION = "biodiversity_knowledge_gemini"
 DB_DIR = os.path.join(ROOT, "chroma_db")
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 SYSTEM = """You are an evidence-grounded environmental scientist.
 Use ONLY the retrieved source passages for factual claims and recommendations.
@@ -45,11 +40,10 @@ or land-use context, ask one specific clarifying question instead of guessing.""
 
 
 @lru_cache(maxsize=1)
-def resources() -> tuple[Any, Any]:
+def resources() -> Any:
     client = chromadb.PersistentClient(path=DB_DIR)
     collection = client.get_collection(COLLECTION)
-    model = SentenceTransformer(MODEL_NAME, device="cpu")
-    return collection, model
+    return collection
 
 
 def enough_context(message: str, structured: dict[str, Any] | None) -> bool:
@@ -61,11 +55,11 @@ def enough_context(message: str, structured: dict[str, Any] | None) -> bool:
 
 
 def retrieve(query: str, structured: dict[str, Any] | None, top_k: int = 6) -> list[dict[str, str]]:
-    collection, model = resources()
+    collection = resources()
     enriched = query
     if structured:
         enriched += "\nStructured land data: " + json.dumps(structured, sort_keys=True)
-    vector = model.encode([enriched], normalize_embeddings=True).tolist()
+    vector = embed_texts([enriched], query=True)
     result = collection.query(query_embeddings=vector, n_results=top_k, include=["documents", "metadatas"])
     documents = result.get("documents", [[]])[0]
     metadata = result.get("metadatas", [[]])[0]

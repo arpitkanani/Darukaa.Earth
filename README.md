@@ -2,8 +2,8 @@
 
 This is a small retrieval-augmented Streamlit application for evidence-backed
 land and ecosystem advice. `ingest.py` extracts the supplied PDFs, optionally
-
-with `BAAI/bge-small-en-v1.5`, and stores it in persistent ChromaDB.
+downloads configured HTML sources, creates hosted Gemini embeddings, and stores
+them in persistent ChromaDB.
 `rag_engine.py` retrieves six passages for every substantive answer, adds the
 last six conversation messages, and streams from Groq with Gemini fallback.
 The prompt requires every recommendation to connect at least three ecological
@@ -26,13 +26,11 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-The code disables the optional TensorFlow backend because embeddings run through
-PyTorch on CPU. This avoids TensorFlow/protobuf conflicts in environments that
-already have TensorFlow installed.
-
 Copy `.env.example` to `.env` and set `GROQ_API_KEY` and either
 `GEMINI_API_KEY` or the existing `GOOGLE_API_KEY`. `KNOWLEDGE_URLS` accepts
 comma-separated HTML URLs; the provided FAO URL can remain in that setting.
+Gemini embeddings use the hosted `gemini-embedding-001` model, so the
+application does not download or load a local sentence-transformers model.
 Groq is tried first when `GROQ_API_KEY` is present. If Gemini returns a
 temporary `503 UNAVAILABLE` response because of provider demand, retry later or
 set `GEMINI_MODEL` to another model available to your API key (the default is
@@ -48,18 +46,26 @@ python ingest.py
 streamlit run app.py
 ```
 
-The first ingestion downloads the embedding model and may take a few minutes on
-CPU. `chroma_db/` is generated locally and ignored by Git. Streamlit keeps
-conversation memory only in the current browser session.
+Run `python ingest.py` once after upgrading from the BGE version. The Gemini
+index uses a different vector size and is stored in a new collection, so the
+old BGE collection cannot be queried with the new embeddings.
+
+The first ingestion calls the Gemini Embeddings API and may take a few minutes
+depending on API quota and network speed. `chroma_db/` is generated locally and
+ignored by Git. Streamlit keeps conversation memory only in the current browser
+session.
 
 ## Chunking strategy
 
 `ingest.py` normalizes whitespace, splits each source into word-based chunks of
 up to 650 words, and uses 100 words of overlap between neighboring chunks
 (a 550-word stride). The same strategy is used for checked-in PDFs, configured
-HTML sources, and sidebar-uploaded PDFs. Retrieval embeds the user query with
-`BAAI/bge-small-en-v1.5` and returns the six closest chunks using cosine
-similarity.
+HTML sources, and sidebar-uploaded PDFs. Retrieval embeds documents and user
+queries with Gemini's hosted `gemini-embedding-001` model using 768-dimensional
+vectors, then returns the six closest chunks using cosine similarity. The
+Chroma collection is named
+`biodiversity_knowledge_gemini` because changing embedding dimensions requires a
+fresh index.
 
 ## JSON question examples
 
@@ -120,7 +126,8 @@ For this project, the recommended Render settings are:
 - **Build command:** `pip install -r requirements.txt && python ingest.py`
 - **Start command:** `streamlit run app.py --server.address 0.0.0.0 --server.port $PORT`
 - **Environment variables:** `GROQ_API_KEY`, `GEMINI_API_KEY` or
-  `GOOGLE_API_KEY`, `GEMINI_MODEL`, and `KNOWLEDGE_URLS`
+  `GOOGLE_API_KEY`, `GEMINI_MODEL`, `GEMINI_EMBEDDING_MODEL`, and
+  `KNOWLEDGE_URLS`
 - **Persistent disk:** mount it at the project data location if uploaded PDFs
   and the Chroma index must survive redeploys.
 
@@ -156,7 +163,7 @@ environment variables.
 ## CI/CD
 
 The repository can be connected to Render so a push to the configured branch
-triggers a new deployment. Each deployment installs the dependencies, rebuilds
-the local knowledge index, and starts Streamlit. For a production setup, add a
+triggers a new deployment. Each deployment installs the dependencies, calls Gemini to rebuild the local
+knowledge index, and starts Streamlit. For a production setup, add a
 CI check that runs Python compilation and a smoke test before Render is
 allowed to deploy.

@@ -5,28 +5,22 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
-
-# sentence-transformers only needs the PyTorch path here. Disabling optional
-# TensorFlow imports avoids unrelated local TensorFlow/protobuf conflicts.
-os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 
 import chromadb
 import requests
 from dotenv import load_dotenv
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
+
+from embeddings import embed_texts
 
 ROOT = Path(__file__).parent
 RAW_DIR = ROOT / "data" / "raw"
 UPLOAD_DIR = ROOT / "data" / "uploads"
 DB_DIR = ROOT / "chroma_db"
-COLLECTION = "biodiversity_knowledge"
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+COLLECTION = "biodiversity_knowledge_gemini"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
@@ -71,11 +65,6 @@ def pdf_text(path: Path) -> str:
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 
-@lru_cache(maxsize=1)
-def embedding_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL, device="cpu")
-
-
 def collection(*, recreate: bool = False):
     client = chromadb.PersistentClient(path=str(DB_DIR))
     existing = client.list_collections()
@@ -96,9 +85,7 @@ def store_documents(documents: list[tuple[str, str]], *, recreate: bool = False)
             texts.append(chunk)
             metadata.append({"source": source, "chunk_index": index})
     if texts:
-        embeddings = embedding_model().encode(
-            texts, batch_size=32, normalize_embeddings=True
-        ).tolist()  # type: ignore
+        embeddings = embed_texts(texts)
         target.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadata)
     return len(texts)
 
