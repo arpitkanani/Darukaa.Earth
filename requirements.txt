@@ -1,0 +1,10 @@
+streamlit>=1.36.0
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+# Prevent transformers from installing/using the optional TensorFlow stack.
+torch>=2.2.0
+pypdf>=4.2.0
+python-dotenv>=1.0.1
+groq>=0.9.0
+google-genai>=0.3.0
+requests>=2.32.0

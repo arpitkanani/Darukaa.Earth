@@ -1,0 +1,7 @@
+.env
+chroma_db/
+data/uploads/
+__pycache__/
+*.py[cod]
+.streamlit/*
+!.streamlit/config.toml
