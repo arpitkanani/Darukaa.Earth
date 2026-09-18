@@ -3,25 +3,22 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 from collections.abc import Iterator
 from functools import lru_cache
 from typing import Any
 
-import chromadb
 from dotenv import load_dotenv
 from groq import Groq
-from google import genai
-from google.genai import errors as genai_errors
-
-from embeddings import embed_texts
+import requests
 
 import memory
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(ROOT, ".env"))
-COLLECTION = "biodiversity_knowledge_gemini"
-DB_DIR = os.path.join(ROOT, "chroma_db")
+INDEX_PATH = os.path.join(ROOT, "data", "tfidf_index.json")
 
 SYSTEM = """You are an evidence-grounded environmental scientist.
 Use ONLY the retrieved source passages for factual claims and recommendations.
@@ -41,9 +38,8 @@ or land-use context, ask one specific clarifying question instead of guessing.""
 
 @lru_cache(maxsize=1)
 def resources() -> Any:
-    client = chromadb.PersistentClient(path=DB_DIR)
-    collection = client.get_collection(COLLECTION)
-    return collection
+    with open(INDEX_PATH, encoding="utf-8") as index_file:
+        return json.load(index_file)
 
 
 def enough_context(message: str, structured: dict[str, Any] | None) -> bool:
@@ -55,26 +51,39 @@ def enough_context(message: str, structured: dict[str, Any] | None) -> bool:
 
 
 def retrieve(query: str, structured: dict[str, Any] | None, top_k: int = 6) -> list[dict[str, str]]:
-    collection = resources()
     enriched = query
     if structured:
         enriched += "\nStructured land data: " + json.dumps(structured, sort_keys=True)
-    vector = embed_texts([enriched], query=True)
-    result = collection.query(query_embeddings=vector, n_results=top_k, include=["documents", "metadatas"])
-    documents = result.get("documents", [[]])[0]
-    metadata = result.get("metadatas", [[]])[0]
-    return [{"text": text, "source": str((meta or {}).get("source", "Unknown source"))}
-            for text, meta in zip(documents, metadata)]
+    index = resources()
+    query_words = re.findall(r"[a-z0-9]{2,}", enriched.lower())
+    counts: dict[str, int] = {}
+    for word in query_words:
+        if word in index["idf"]:
+            counts[word] = counts.get(word, 0) + 1
+    total = sum(counts.values()) or 1
+    query_vector = {word: count / total * index["idf"][word] for word, count in counts.items()}
+    norm = math.sqrt(sum(value * value for value in query_vector.values())) or 1
+    query_vector = {word: value / norm for word, value in query_vector.items()}
+    ranked = []
+    for position, document_vector in enumerate(index["vectors"]):
+        score = sum(query_vector.get(word, 0.0) * value for word, value in document_vector.items())
+        ranked.append((score, position))
+    ranked.sort(reverse=True)
+    return [
+        {"text": index["documents"][position], "source": index["sources"][position]}
+        for score, position in ranked[:top_k]
+        if score > 0
+    ]
 
 
-def _prompt(message: str, structured: dict[str, Any] | None, context: list[dict[str, str]]) -> str:
+def _prompt(message: str, structured: dict[str, Any] | None, context: list[dict[str, str]], session_id: str) -> str:
     passages = "\n\n".join(f"[{item['source']}]\n{item['text']}" for item in context)
     data = json.dumps(structured, sort_keys=True) if structured else "(none)"
     return f"""Retrieved passages:
 {passages}
 
 Conversation memory:
-{memory.as_prompt()}
+{memory.as_prompt(session_id)}
 
 Structured input:
 {data}
@@ -83,67 +92,49 @@ Current user message:
 {message}"""
 
 
-def stream_answer(message: str, structured: dict[str, Any] | None = None) -> tuple[Iterator[str], list[str]]:
+def _gemini(prompt: str) -> str:
+    key = os.getenv("GOOGLE_API_KEY")
+    if not key:
+        raise RuntimeError("GOOGLE_API_KEY is not configured")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        params={"key": key}, timeout=60,
+        json={"system_instruction": {"parts": [{"text": SYSTEM}]}, "contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}},
+    )
+    if not response.ok:
+        raise RuntimeError(f"Gemini returned HTTP {response.status_code}")
+    return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _groq(prompt: str) -> str:
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+    response = Groq(api_key=key).chat.completions.create(
+        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}], temperature=0.2,
+    )
+    return response.choices[0].message.content or "The provider returned an empty answer."
+
+
+def stream_answer(message: str, structured: dict[str, Any] | None = None, session_id: str = "default") -> tuple[Iterator[str], list[str]]:
     if not enough_context(message, structured):
         return iter(["Please share at least your soil condition (such as organic carbon), rainfall or water pattern, and land-use/crop type so I can give an evidence-backed recommendation."]), []
     context = retrieve(message, structured)
-    prompt = _prompt(message, structured, context)
+    prompt = _prompt(message, structured, context, session_id)
     sources = list(dict.fromkeys(item["source"] for item in context))
 
     def generate() -> Iterator[str]:
-        groq_key = os.getenv("GROQ_API_KEY")
-        gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        if groq_key:
+        errors = []
+        for provider in (_gemini, _groq):
             try:
-                client = Groq(api_key=groq_key)
-                response = client.chat.completions.create(
-                    model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),  # or "opt/ossaa-30b" qwen/qwen3.8-27b
-                    messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
-                    temperature=0.2, stream=True,
-                )
-                for item in response:
-                    token = item.choices[0].delta.content
-                    if token:
-                        yield token
+                answer = provider(prompt)
+                for part in re.findall(r".{1,80}(?:\s+|$)", answer, flags=re.S):
+                    yield part
                 return
-            except Exception as groq_error:
-                if not gemini_key:
-                    raise RuntimeError("Groq failed and no Gemini key is configured.") from groq_error
-        if not gemini_key:
-            raise RuntimeError("Set GROQ_API_KEY or GEMINI_API_KEY/GOOGLE_API_KEY in .env.")
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        client = genai.Client(api_key=gemini_key)
-        try:
-            response = client.models.generate_content_stream(
-                model=model_name,
-                contents=prompt,
-                config={"system_instruction": SYSTEM, "temperature": 0.2},
-            )
-        except genai_errors.ServerError as gemini_error:
-            raise RuntimeError(
-                f"Gemini is temporarily unavailable (503) for model '{model_name}'. "
-                "Retry in a few minutes, or configure GROQ_API_KEY or another "
-                "available GEMINI_MODEL in .env."
-            ) from gemini_error
-        except genai_errors.ClientError as gemini_error:
-            raise RuntimeError(
-                f"Gemini rejected model '{model_name}'. Check GEMINI_MODEL in .env "
-                "and choose a model available to your API key."
-            ) from gemini_error
-        try:
-            for item in response:
-                if item.text:
-                    yield item.text
-        except genai_errors.ServerError as gemini_error:
-            raise RuntimeError(
-                f"Gemini became temporarily unavailable (503) for model '{model_name}'. "
-                "Retry in a few minutes, or configure GROQ_API_KEY or another "
-                "available GEMINI_MODEL in .env."
-            ) from gemini_error
-        except genai_errors.ClientError as gemini_error:
-            raise RuntimeError(
-                f"Gemini rejected model '{model_name}'. Check GEMINI_MODEL in .env "
-                "and choose a model available to your API key."
-            ) from gemini_error
+            except Exception as error:
+                errors.append(f"{provider.__name__[1:]}: {error}")
+        raise RuntimeError("Both text providers failed. " + " | ".join(errors))
 
     return generate(), sources

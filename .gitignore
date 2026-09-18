@@ -5,5 +5,9 @@ __pycache__/
 *.py[cod]
 .streamlit/*
 !.streamlit/config.toml
-
-data
+Hackathon_Challenge__AI_Revised_882184.pdf
+data/uploads/
+data/tfidf_index.json
+Darukaa_Earth_Submission.docx
+build_submission_doc.py
+data/Hackathon_Challenge__AI_Revised_882184.pdf

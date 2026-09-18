@@ -1,102 +1,41 @@
-"""Streamlit entrypoint for the Darukaa.Earth biodiversity assistant."""
-
+"""FastAPI web application for the Darukaa.Earth TF-IDF RAG assistant."""
 from __future__ import annotations
-
-import hashlib
-import json
-from pathlib import Path
-
-import streamlit as st
-from pypdf.errors import PdfReadError
-
-import ingest
-import memory
+import uuid
+from typing import Any
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
+import ingest, memory
 from rag_engine import resources, stream_answer
 
-st.set_page_config(page_title="Darukaa.Earth", page_icon="🌱")
-st.title("Darukaa.Earth Biodiversity Intelligence")
-st.caption("Evidence-backed land and ecosystem recommendations from the supplied knowledge base.")
-memory.initialize()
+app = FastAPI(title="Darukaa.Earth")
 
-with st.sidebar:
-    st.header("Add knowledge")
-    st.caption("Upload a PDF (maximum 20 MB) to add it to the current knowledge base.")
-    uploaded_pdf = st.file_uploader(
-        "Drag and drop a PDF here",
-        type=["pdf"],
-        accept_multiple_files=False,
-        help="Only PDF files up to 20 MB are accepted.",
-    )
-    if uploaded_pdf is not None:
-        if uploaded_pdf.size > ingest.MAX_UPLOAD_BYTES:
-            st.error("This file is larger than the 20 MB limit.")
-        elif st.button("Ingest PDF", type="primary", use_container_width=True):
-            safe_name = Path(uploaded_pdf.name).name
-            digest = hashlib.sha256(uploaded_pdf.getvalue()).hexdigest()[:12]
-            destination = ingest.UPLOAD_DIR / f"{digest}_{safe_name}"
-            ingest.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                destination.write_bytes(uploaded_pdf.getvalue())
-                chunk_count = ingest.ingest_pdf(destination, source=safe_name)
-                resources.cache_clear()
-            except (OSError, RuntimeError, ValueError, PdfReadError) as exc:
-                cleanup_error = None
-                if destination.exists():
-                    try:
-                        destination.unlink()
-                    except OSError as unlink_error:
-                        cleanup_error = unlink_error
-                message = f"Could not ingest this PDF: {exc}"
-                if cleanup_error:
-                    message += f" The temporary upload could not be removed: {cleanup_error}"
-                st.error(message)
-            else:
-                st.success(f"Added {safe_name} ({chunk_count} chunks).")
+class Question(BaseModel):
+    question: str = Field(min_length=2, max_length=4000)
+    context: dict[str, Any] | None = None
+    session_id: str | None = Field(default=None, max_length=100)
 
-for item in memory.messages():
-    with st.chat_message(item["role"]):
-        st.markdown(item["content"])
+@app.on_event("startup")
+def startup() -> None: ingest.ensure_index()
 
-with st.expander("Structured input (optional)"):
-    st.caption("Paste a JSON object with a required question and optional land context.")
-    structured_text = st.text_area(
-        "Land context and question (JSON)",
-        height=220,
-        placeholder='{"question": "How can I improve soil health?", "soil_organic_carbon": 0.3, "rainfall": "low", "crop": "wheat", "region": "semi-arid"}',
-    )
-    submit_json = st.button("Ask JSON question", type="primary")
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {"status":"ok", "chunks":len(resources()["documents"]), "retrieval":"local-tfidf"}
 
-question = st.chat_input("Ask about your land or ecosystem...")
-structured = None
-if structured_text.strip():
-    try:
-        parsed = json.loads(structured_text)
-        if not isinstance(parsed, dict):
-            raise ValueError("The JSON root must be an object.")
-        json_question = parsed.pop("question", None)
-        if json_question is not None and not isinstance(json_question, str):
-            raise ValueError('The "question" value must be a string.')
-        if submit_json:
-            if not json_question or not json_question.strip():
-                raise ValueError('Add a non-empty "question" field to submit JSON.')
-            question = json_question.strip()
-        structured = parsed
-    except (json.JSONDecodeError, ValueError) as exc:
-        if submit_json or question:
-            st.error(f"Invalid structured JSON: {exc}")
-            st.stop()
-
-if question:
-    memory.add("user", question)
-    with st.chat_message("user"):
-        st.markdown(question)
-    with st.chat_message("assistant"):
+@app.post("/api/chat")
+def chat(payload: Question) -> StreamingResponse:
+    session_id = payload.session_id or str(uuid.uuid4())
+    try: generator, sources = stream_answer(payload.question.strip(), payload.context, session_id)
+    except Exception as error: raise HTTPException(400, str(error)) from error
+    def events():
         try:
-            stream, sources = stream_answer(question, structured)
-            answer = st.write_stream(stream)
-        except RuntimeError as exc:
-            st.error(str(exc))
-        else:
-            if sources:
-                st.caption("Sources: " + ", ".join(sources))
-            memory.add("assistant", answer)
+            memory.add(session_id, "user", payload.question.strip())
+            yield from generator
+            memory.add(session_id, "assistant", "Answer delivered to browser.")
+        except Exception: yield "\n\n[Unable to answer. Both configured providers were unavailable; please retry shortly.]"
+    return StreamingResponse(events(), media_type="text/plain; charset=utf-8", headers={"X-Session-Id":session_id,"X-Sources":" | ".join(sources)})
+
+@app.get("/", response_class=HTMLResponse)
+def home() -> str: return HTML
+
+HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Terra</title><style>body{margin:auto;max-width:850px;background:#f5f8f3;color:#17351f;font:16px system-ui;padding:26px}h1{margin-bottom:3px}.sub{color:#57705d}.chat{min-height:300px;background:#fff;border:1px solid #d9e5d9;border-radius:12px;padding:18px;margin:20px 0}.msg{white-space:pre-wrap;padding:12px;margin:9px 0;border-radius:9px}.user{background:#e5f2e3}.assistant{background:#f6f6f6}textarea{box-sizing:border-box;width:100%;height:105px;padding:12px;border:1px solid #b6cbb7;border-radius:8px;font:inherit}button{margin-top:9px;background:#216e39;color:white;border:0;border-radius:8px;padding:11px 22px;font-weight:600;cursor:pointer}small{color:#557}</style></head><body><h1>🌱 Terra</h1><div class="sub">Grounded biodiversity advice from your environmental PDFs.</div><div id="chat" class="chat"><div class="msg assistant">Ask in plain text, or paste JSON with a question and land details.</div></div><textarea id="input" placeholder='Ask a question… or paste JSON: {"question":"What should I do?","rainfall":"low","crop":"wheat"}'></textarea><button onclick="ask()">Send</button><p><small id="status"></small></p><script>let sid=localStorage.terraSession||crypto.randomUUID();localStorage.terraSession=sid;const chat=document.querySelector('#chat'),status=document.querySelector('#status'),input=document.querySelector('#input');function add(role,text){let x=document.createElement('div');x.className='msg '+role;x.textContent=text;chat.append(x);chat.scrollTop=chat.scrollHeight;return x}async function ask(){let raw=input.value.trim(),q=raw,ctx=null;if(!raw)return;if(raw.startsWith('{'))try{let data=JSON.parse(raw);q=data.question;if(typeof q!=='string'||!q.trim())throw Error('JSON needs a non-empty "question" field.');delete data.question;ctx=data}catch(e){status.textContent='Invalid JSON: '+e.message;return}add('user',q);input.value='';let out=add('assistant','');status.textContent='Retrieving evidence…';try{let r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,context:ctx,session_id:sid})});sid=r.headers.get('X-Session-Id')||sid;localStorage.terraSession=sid;if(!r.ok)throw Error((await r.json()).detail);let reader=r.body.getReader(),dec=new TextDecoder();while(true){let z=await reader.read();if(z.done)break;out.textContent+=dec.decode(z.value,{stream:true});chat.scrollTop=chat.scrollHeight}status.textContent=r.headers.get('X-Sources')?'Sources: '+r.headers.get('X-Sources'):'Response complete.'}catch(e){out.textContent='Error: '+e.message;status.textContent='Check keys or retry.'}}</script></body></html>'''
