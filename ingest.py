@@ -21,6 +21,7 @@ RAW_DIR = ROOT / "data" / "raw"
 UPLOAD_DIR = ROOT / "data" / "uploads"
 DB_DIR = ROOT / "chroma_db"
 COLLECTION = "biodiversity_knowledge_gemini"
+LEGACY_COLLECTION = "biodiversity_knowledge"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
@@ -69,6 +70,8 @@ def collection(*, recreate: bool = False):
     client = chromadb.PersistentClient(path=str(DB_DIR))
     existing = client.list_collections()
     existing_names = [item if isinstance(item, str) else item.name for item in existing]
+    if recreate and LEGACY_COLLECTION in existing_names:
+        client.delete_collection(LEGACY_COLLECTION)
     if recreate and COLLECTION in existing_names:
         client.delete_collection(COLLECTION)
     return client.get_or_create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})

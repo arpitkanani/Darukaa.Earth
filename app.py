@@ -39,7 +39,7 @@ with st.sidebar:
                 destination.write_bytes(uploaded_pdf.getvalue())
                 chunk_count = ingest.ingest_pdf(destination, source=safe_name)
                 resources.cache_clear()
-            except (OSError, ValueError, PdfReadError) as exc:
+            except (OSError, RuntimeError, ValueError, PdfReadError) as exc:
                 cleanup_error = None
                 if destination.exists():
                     try:

@@ -48,7 +48,8 @@ streamlit run app.py
 
 Run `python ingest.py` once after upgrading from the BGE version. The Gemini
 index uses a different vector size and is stored in a new collection, so the
-old BGE collection cannot be queried with the new embeddings.
+old BGE collection cannot be queried with the new embeddings. The rebuild also
+removes the old BGE collection from the local Chroma database.
 
 The first ingestion calls the Gemini Embeddings API and may take a few minutes
 depending on API quota and network speed. `chroma_db/` is generated locally and

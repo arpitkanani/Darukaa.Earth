@@ -7,6 +7,7 @@ from collections.abc import Sequence
 
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSIONS = 768
@@ -36,10 +37,10 @@ def embed_texts(texts: Sequence[str], *, query: bool = False) -> list[list[float
             response = client.models.embed_content(
                 model=model_name,
                 contents=list(texts[start : start + BATCH_SIZE]),
-                config={
-                    "task_type": task_type,
-                    "output_dimensionality": EMBEDDING_DIMENSIONS,
-                },
+                config=types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=EMBEDDING_DIMENSIONS,
+                ),
             )
             result.extend(
                 [list(embedding.values) for embedding in response.embeddings]
